@@ -27,7 +27,7 @@ class Settings(BaseModel):
     fargate_image: str = os.getenv("FARGATE_IMAGE", "ghcr.io/dask/dask:latest")
 
     # --- Analysis defaults ---
-    max_polygon_area_km2: float = float(os.getenv("MAX_POLYGON_AREA_KM2", "50000"))
+    max_polygon_area_km2: float = float(os.getenv("MAX_POLYGON_AREA_KM2", "2000"))
     default_cloud_cover_pct: int = int(os.getenv("DEFAULT_CLOUD_COVER_PCT", "20"))
     default_collection: str = os.getenv("DEFAULT_COLLECTION", "sentinel-2-l2a")
 

@@ -8,8 +8,11 @@ same class computes NDVI/EVI/SAVI/MNDWI regardless of Sentinel-2 vs
 Landsat vs anything else with the right bands.
 """
 import numpy as np
+import rioxarray  # noqa: F401 (registers the .rio accessor)
 import stackstac
 import xarray as xr
+from rasterio.features import geometry_mask
+from rasterio.warp import transform_geom
 
 
 class VegetationIndexEngine:
@@ -50,19 +53,24 @@ class VegetationIndexEngine:
         self.reflectance = self.REFLECTANCE_SCALE.get(collection, {"scale": 1.0, "offset": 0.0})
         self.mask_band = self.CLOUD_MASK_BAND.get(collection)
         self._mask_cache: xr.DataArray | None = None
+        self._polygon_cache: xr.DataArray | None = None
+
+    @property
+    def footprint(self) -> xr.DataArray | None:
+        """2D (y, x) boolean mask of pixels inside the AOI polygon, once computed."""
+        return self._polygon_cache
 
     def _resolve_asset(self, key: str) -> str:
         if key == "blue" and "blue" not in self.bands:
             key = "green"
         return self.bands[key]
 
-    def _stack(self, geometry: dict, band_keys: list[str]) -> xr.DataArray:
-        assets = []
-        for key in band_keys:
-            asset = self._resolve_asset(key)
-            if asset not in assets:
-                assets.append(asset)
-
+    def _stack_assets(self, geometry: dict, assets: list[str]) -> xr.DataArray:
+        # xy_coords="center": label pixels by their centres. stackstac's
+        # default is the top-left corner, but rioxarray (used for clipping
+        # and GeoTIFF export) assumes centres, which shifted the exported
+        # GeoTIFF by half a pixel. Every stack must use the same setting so
+        # the bands, cloud mask and polygon mask share one grid.
         return stackstac.stack(
             self.items,
             assets=assets,
@@ -71,7 +79,16 @@ class VegetationIndexEngine:
             bounds_latlon=self._bbox(geometry),
             rescale=False,
             chunksize="auto",
+            xy_coords="center",
         )
+
+    def _stack(self, geometry: dict, band_keys: list[str]) -> xr.DataArray:
+        assets = []
+        for key in band_keys:
+            asset = self._resolve_asset(key)
+            if asset not in assets:
+                assets.append(asset)
+        return self._stack_assets(geometry, assets)
 
     @staticmethod
     def _bbox(geometry: dict) -> tuple:
@@ -81,12 +98,6 @@ class VegetationIndexEngine:
         return (min(xs), min(ys), max(xs), max(ys))
 
     def _scene_offset(self, stack: xr.DataArray):
-        """
-        Additive offset in reflectance units: a plain float, or a per-scene
-        (time,) DataArray for Sentinel-2. stackstac keeps item properties as
-        coordinates; a property shared by every scene becomes a scalar
-        coordinate, which this handles the same way.
-        """
         if self.collection != "sentinel-2-l2a":
             return self.reflectance["offset"]
 
@@ -104,10 +115,30 @@ class VegetationIndexEngine:
     def _band(self, stack: xr.DataArray, key: str) -> xr.DataArray:
         asset = self._resolve_asset(key)
         raw = stack.sel(band=asset).astype("float32")
-        # DN 0 is nodata. Without this, the offset would turn it into a
-        # reflectance of -0.1 and it would leak into the averages.
-        raw = raw.where(raw != 0)
+        raw = raw.where(raw != 0)  # DN 0 is nodata
         return raw * self.reflectance["scale"] + self._scene_offset(stack)
+
+    def _polygon_mask(self, template: xr.DataArray, geometry: dict) -> xr.DataArray:
+        """
+        True for pixels inside the AOI polygon. The stack covers the
+        polygon's bounding box, so without this an irregular boundary
+        would average in everything inside its bbox. all_touched=True
+        keeps edge pixels that the boundary passes through.
+        """
+        if self._polygon_cache is not None:
+            return self._polygon_cache
+
+        grid = template.rio.write_crs(f"EPSG:{self.epsg}")
+        geom_projected = transform_geom("EPSG:4326", f"EPSG:{self.epsg}", geometry)
+        inside = geometry_mask(
+            [geom_projected],
+            out_shape=(grid.sizes["y"], grid.sizes["x"]),
+            transform=grid.rio.transform(),
+            invert=True,
+            all_touched=True,
+        )
+        self._polygon_cache = xr.DataArray(inside, coords={"y": grid["y"], "x": grid["x"]}, dims=("y", "x"))
+        return self._polygon_cache
 
     def _cloud_valid_mask(self, geometry: dict) -> xr.DataArray | None:
         if self.mask_band is None:
@@ -115,16 +146,7 @@ class VegetationIndexEngine:
         if self._mask_cache is not None:
             return self._mask_cache
 
-        scl_stack = stackstac.stack(
-            self.items,
-            assets=[self.mask_band],
-            resolution=self.resolution,
-            epsg=self.epsg,
-            bounds_latlon=self._bbox(geometry),
-            rescale=False,
-            chunksize="auto",
-        )
-        scl = scl_stack.sel(band=self.mask_band)
+        scl = self._stack_assets(geometry, [self.mask_band]).sel(band=self.mask_band)
         self._mask_cache = ~scl.isin(list(self.SCL_BAD_VALUES))
         return self._mask_cache
 
@@ -152,9 +174,11 @@ class VegetationIndexEngine:
             green, swir = self._band(stack, "green"), self._band(stack, "swir16")
             result = (green - swir) / (green + swir + eps)
 
-        mask = self._cloud_valid_mask(geometry)
-        if mask is not None:
-            result = result.where(mask)
+        cloud_mask = self._cloud_valid_mask(geometry)
+        if cloud_mask is not None:
+            result = result.where(cloud_mask)
+
+        result = result.where(self._polygon_mask(result, geometry))
 
         result.name = index
         return result
