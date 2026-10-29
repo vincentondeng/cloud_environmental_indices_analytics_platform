@@ -150,6 +150,35 @@ class VegetationIndexEngine:
         self._mask_cache = ~scl.isin(list(self.SCL_BAD_VALUES))
         return self._mask_cache
 
+    def _merge_same_day(self, data: xr.DataArray) -> xr.DataArray:
+        """
+        An AOI spanning several Sentinel-2 tiles gets one STAC item per tile
+        per pass. Each covers only part of the AOI, so treating them as
+        separate observations understates clear-sky coverage and averages
+        partial-area snapshots as if each were the whole area. This merges
+        each day's items into one image, keeping the first clear value at
+        each pixel. It must run AFTER cloud/nodata masking, so a clear pixel
+        from one tile is never overwritten by a cloudy one from another.
+        Grouping is by UTC day: one orbit pass falls within a single UTC day
+        everywhere except right next to the antimeridian.
+        """
+        days = data["time"].values.astype("datetime64[D]")
+        data = data.reset_coords(drop=True)  # per-scene properties don't survive a merge
+        merged = []
+        for day in np.unique(days):
+            idx = np.flatnonzero(days == day)
+            # drop=True discards each scene's own timestamp, which would
+            # otherwise conflict between same-day scenes (07:40 vs 07:41) and
+            # be dropped unpredictably by fillna. The day label replaces it.
+            combined = data.isel(time=idx[0], drop=True)
+            for i in idx[1:]:
+                combined = combined.fillna(data.isel(time=i, drop=True))
+            merged.append(combined.expand_dims(time=[np.datetime64(day, "ns")]))
+        out = xr.concat(merged, dim="time")
+        # Write the CRS explicitly so the GeoTIFF export never depends on
+        # stackstac's attributes surviving the merge.
+        return out.rio.write_crs(f"EPSG:{self.epsg}")
+
     def compute(self, geometry: dict, index: str) -> xr.DataArray:
         if index not in self.INDEX_BAND_KEYS:
             raise ValueError(f"Unsupported index: {index}")
@@ -178,6 +207,7 @@ class VegetationIndexEngine:
         if cloud_mask is not None:
             result = result.where(cloud_mask)
 
+        result = self._merge_same_day(result)
         result = result.where(self._polygon_mask(result, geometry))
 
         result.name = index
