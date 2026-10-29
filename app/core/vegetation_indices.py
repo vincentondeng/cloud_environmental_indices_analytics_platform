@@ -13,68 +13,65 @@ import xarray as xr
 
 
 class VegetationIndexEngine:
-    # Raw STAC assets are scaled integers, not physical reflectance —
-    # Sentinel-2 L2A stores 0-10000 with no offset; Landsat C2 L2 uses
-    # USGS's documented scale/offset to convert DN to true reflectance.
-    # This doesn't matter for pure ratios (NDVI, MNDWI — the scale cancels
-    # algebraically), but it silently breaks any index with an additive
-    # constant: EVI's "+1" and SAVI's "L" assume 0-1 reflectance. Against
-    # raw ~10000-scale values those constants are negligible — EVI's
-    # denominator can land near zero (huge blowup), and SAVI's soil term
-    # effectively stops doing anything.
+    # Raw assets are scaled integers, not reflectance. Landsat C2 L2 uses a
+    # fixed documented scale/offset. Sentinel-2 L2A uses scale 1/10000, but
+    # its offset depends on each scene's processing baseline (see
+    # _scene_offset), so the 0.0 here is a placeholder that is overridden.
     REFLECTANCE_SCALE = {
         "sentinel-2-l2a": {"scale": 1 / 10000, "offset": 0.0},
         "landsat-c2-l2": {"scale": 0.0000275, "offset": -0.2},
     }
 
-    # Per-pixel cloud/shadow masking via Sentinel-2's Scene Classification
-    # Layer (SCL) — separate from, and much finer-grained than, the
-    # scene-level eo:cloud_cover filter applied at STAC search time. A
-    # scene can pass a 30%-cloud-cover filter while still having cloud or
-    # shadow sitting directly over the AOI; SCL flags that per pixel.
-    # Landsat has an equivalent (QA_PIXEL bit flags) but with a different
-    # encoding — not implemented yet, so masking is skipped for it for now.
+    # ESA processing baseline 04.00+ stores L2A as DN = reflectance*10000 + 1000,
+    # so reflectance = DN/10000 - 0.1. Older baselines have no offset. The
+    # baseline is a property of each scene (reprocessed archives carry newer
+    # baselines), not of the acquisition date, so it is decided per scene.
+    S2_OFFSET_BASELINE = 4.0
+    S2_OFFSET = -0.1
+
     CLOUD_MASK_BAND = {
         "sentinel-2-l2a": "SCL",
     }
-    # SCL classes excluded as unusable: 0 no data, 1 saturated/defective,
-    # 3 cloud shadow, 8/9 cloud medium/high probability, 10 thin cirrus.
-    # Kept as valid: 2 dark area, 4 vegetation, 5 bare soil, 6 water,
-    # 7 unclassified, 11 snow/ice.
     SCL_BAD_VALUES = {0, 1, 3, 8, 9, 10}
 
+    INDEX_BAND_KEYS = {
+        "NDVI": ["red", "nir"],
+        "EVI": ["red", "nir", "blue"],
+        "SAVI": ["red", "nir"],
+        "MNDWI": ["green", "swir16"],
+    }
+
     def __init__(self, items: list, bands: dict, resolution: int = 10, epsg: int = 3857, collection: str = "sentinel-2-l2a"):
-        """
-        items:      list of pystac Items from StacSearchClient.search()
-        bands:      dict like {"red": "B04", "nir": "B08", ...}
-        resolution: output pixel size in `epsg` units (meters)
-        collection: STAC collection id, used to pick the right reflectance
-                    scale/offset (falls back to scale=1/offset=0 — i.e. no
-                    change — for unregistered collections) and cloud mask band
-        """
         self.items = items
         self.bands = bands
         self.resolution = resolution
         self.epsg = epsg
+        self.collection = collection
         self.reflectance = self.REFLECTANCE_SCALE.get(collection, {"scale": 1.0, "offset": 0.0})
         self.mask_band = self.CLOUD_MASK_BAND.get(collection)
         self._mask_cache: xr.DataArray | None = None
 
-    def _stack(self, geometry: dict) -> xr.DataArray:
-        needed = list(self.bands.values())
-        # rescale=False: let each collection's own reflectance scaling stand.
-        # (stackstac's default rescale collides with already-scaled L2A/L2
-        #  surface reflectance products and silently skews every index.)
-        arr = stackstac.stack(
+    def _resolve_asset(self, key: str) -> str:
+        if key == "blue" and "blue" not in self.bands:
+            key = "green"
+        return self.bands[key]
+
+    def _stack(self, geometry: dict, band_keys: list[str]) -> xr.DataArray:
+        assets = []
+        for key in band_keys:
+            asset = self._resolve_asset(key)
+            if asset not in assets:
+                assets.append(asset)
+
+        return stackstac.stack(
             self.items,
-            assets=needed,
+            assets=assets,
             resolution=self.resolution,
             epsg=self.epsg,
             bounds_latlon=self._bbox(geometry),
             rescale=False,
-            chunksize="auto",  # Dask-backed; no compute happens yet
+            chunksize="auto",
         )
-        return arr
 
     @staticmethod
     def _bbox(geometry: dict) -> tuple:
@@ -83,18 +80,36 @@ class VegetationIndexEngine:
         ys = [c[1] for c in coords]
         return (min(xs), min(ys), max(xs), max(ys))
 
-    def _band(self, stack: xr.DataArray, name: str) -> xr.DataArray:
-        raw = stack.sel(band=self.bands[name]).astype("float32")
-        return raw * self.reflectance["scale"] + self.reflectance["offset"]
+    def _scene_offset(self, stack: xr.DataArray):
+        """
+        Additive offset in reflectance units: a plain float, or a per-scene
+        (time,) DataArray for Sentinel-2. stackstac keeps item properties as
+        coordinates; a property shared by every scene becomes a scalar
+        coordinate, which this handles the same way.
+        """
+        if self.collection != "sentinel-2-l2a":
+            return self.reflectance["offset"]
+
+        key = "s2:processing_baseline"
+        if key not in stack.coords:
+            raise ValueError(
+                "Scene metadata has no s2:processing_baseline, so the correct "
+                "reflectance offset can't be determined."
+            )
+        baseline = stack.coords[key]
+        is_new = np.vectorize(lambda b: float(b) >= self.S2_OFFSET_BASELINE)(baseline.values)
+        offsets = np.where(is_new, self.S2_OFFSET, 0.0)
+        return xr.DataArray(offsets, coords=baseline.coords, dims=baseline.dims)
+
+    def _band(self, stack: xr.DataArray, key: str) -> xr.DataArray:
+        asset = self._resolve_asset(key)
+        raw = stack.sel(band=asset).astype("float32")
+        # DN 0 is nodata. Without this, the offset would turn it into a
+        # reflectance of -0.1 and it would leak into the averages.
+        raw = raw.where(raw != 0)
+        return raw * self.reflectance["scale"] + self._scene_offset(stack)
 
     def _cloud_valid_mask(self, geometry: dict) -> xr.DataArray | None:
-        """
-        Returns a lazy (time, y, x) boolean mask — True where the pixel is
-        a genuine clear observation — or None if this collection has no
-        registered mask band. Cached on the instance: the same engine is
-        reused across multiple compute() calls (one per requested index),
-        and the mask only needs fetching once per AOI.
-        """
         if self.mask_band is None:
             return None
         if self._mask_cache is not None:
@@ -114,23 +129,18 @@ class VegetationIndexEngine:
         return self._mask_cache
 
     def compute(self, geometry: dict, index: str) -> xr.DataArray:
-        """
-        Returns a lazy (time, y, x) DataArray for the requested index,
-        with cloud/shadow-flagged pixels masked to NaN (see
-        _cloud_valid_mask). Caller decides when/how to .compute() —
-        typically inside a Dask cluster context so the reduction is
-        distributed across workers.
-        """
-        stack = self._stack(geometry)
-        eps = 1e-6  # guard against divide-by-zero on nodata edges
+        if index not in self.INDEX_BAND_KEYS:
+            raise ValueError(f"Unsupported index: {index}")
+
+        stack = self._stack(geometry, self.INDEX_BAND_KEYS[index])
+        eps = 1e-6
 
         if index == "NDVI":
             red, nir = self._band(stack, "red"), self._band(stack, "nir")
             result = (nir - red) / (nir + red + eps)
 
         elif index == "EVI":
-            red, nir = self._band(stack, "red"), self._band(stack, "nir")
-            blue = self._band(stack, self.bands.get("blue", "green"))
+            red, nir, blue = self._band(stack, "red"), self._band(stack, "nir"), self._band(stack, "blue")
             result = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1 + eps)
 
         elif index == "SAVI":
@@ -141,9 +151,6 @@ class VegetationIndexEngine:
         elif index == "MNDWI":
             green, swir = self._band(stack, "green"), self._band(stack, "swir16")
             result = (green - swir) / (green + swir + eps)
-
-        else:
-            raise ValueError(f"Unsupported index: {index}")
 
         mask = self._cloud_valid_mask(geometry)
         if mask is not None:
