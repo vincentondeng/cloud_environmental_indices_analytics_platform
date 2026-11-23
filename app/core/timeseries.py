@@ -27,10 +27,11 @@ def build_lazy_mean_and_valid(index_cube: xr.DataArray, footprint: xr.DataArray 
     spatial_mean = index_cube.mean(dim=["x", "y"], skipna=True)
     valid_count = index_cube.notnull().sum(dim=["x", "y"])
     if footprint is not None:
-        total = int(footprint.sum())
+        # Stays lazy: summed inside the same compute as everything else.
+        total = footprint.sum().clip(min=1)
     else:
-        total = index_cube.sizes["x"] * index_cube.sizes["y"]
-    valid_frac = valid_count / max(total, 1)
+        total = max(index_cube.sizes["x"] * index_cube.sizes["y"], 1)
+    valid_frac = valid_count / total
     return spatial_mean, valid_frac
 
 

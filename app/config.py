@@ -4,6 +4,7 @@ Keeps the STAC catalog, Dask cluster mode, and AWS settings swappable
 without touching application code.
 """
 import os
+import tempfile
 from functools import lru_cache
 from pydantic import BaseModel
 
@@ -30,6 +31,12 @@ class Settings(BaseModel):
     max_polygon_area_km2: float = float(os.getenv("MAX_POLYGON_AREA_KM2", "2000"))
     default_cloud_cover_pct: int = int(os.getenv("DEFAULT_CLOUD_COVER_PCT", "20"))
     default_collection: str = os.getenv("DEFAULT_COLLECTION", "sentinel-2-l2a")
+
+    # --- Job results ---
+    # Raster files for finished jobs live on disk here, one folder per job,
+    # and are removed (together with the job record) after job_ttl_hours.
+    results_dir: str = os.getenv("RESULTS_DIR", os.path.join(tempfile.gettempdir(), "ndvi-results"))
+    job_ttl_hours: float = float(os.getenv("JOB_TTL_HOURS", "24"))
 
     # --- API ---
     api_title: str = "Cloud NDVI Analytics Platform"

@@ -5,3 +5,9 @@ __pycache__/
 .DS_Store
 *.egg-info/
 .pytest_cache/
+
+# local test outputs and clean-up folder (never commit)
+_to_delete/
+*.tif
+*_test.png
+test_composite.png

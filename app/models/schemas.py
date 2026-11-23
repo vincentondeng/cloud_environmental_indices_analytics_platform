@@ -56,6 +56,15 @@ class TimeSeriesPoint(BaseModel):
     cloud_free_pct: float | None = None
 
 
+class MapLayer(BaseModel):
+    """What a web map needs to place the composite overlay and draw its legend."""
+    bounds: list[list[float]] = Field(..., description="[[south, west], [north, east]] in WGS84 degrees")
+    vmin: float = Field(..., description="Value at the bottom of the colour scale (2nd percentile)")
+    vmax: float = Field(..., description="Value at the top of the colour scale (98th percentile)")
+    colormap: str
+    legend_colors: list[str] = Field(..., description="Hex colours from vmin to vmax, for a legend")
+
+
 class IndexResult(BaseModel):
     index: VegetationIndex
     mean: float | None
@@ -65,6 +74,11 @@ class IndexResult(BaseModel):
     trend_per_year: float | None = None
     time_series: list[TimeSeriesPoint]
     chart_json: str = Field(..., description="Plotly figure JSON for client-side rendering")
+    map: MapLayer | None = Field(None, description="Overlay placement and legend for the composite map")
+    files: list[str] = Field(
+        default_factory=list,
+        description="Downloadable file kinds for this index: fetch from /jobs/{job_id}/files/{index}/{kind}",
+    )
 
 
 class AnalysisResponse(BaseModel):

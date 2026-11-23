@@ -7,7 +7,9 @@ mapping the STAC collection uses (see stac_client.BAND_ALIASES) and the
 same class computes NDVI/EVI/SAVI/MNDWI regardless of Sentinel-2 vs
 Landsat vs anything else with the right bands.
 """
+import dask.array as da
 import numpy as np
+from affine import Affine
 import rioxarray  # noqa: F401 (registers the .rio accessor)
 import stackstac
 import xarray as xr
@@ -129,14 +131,29 @@ class VegetationIndexEngine:
             return self._polygon_cache
 
         grid = template.rio.write_crs(f"EPSG:{self.epsg}")
+        transform = grid.rio.transform()
         geom_projected = transform_geom("EPSG:4326", f"EPSG:{self.epsg}", geometry)
-        inside = geometry_mask(
-            [geom_projected],
-            out_shape=(grid.sizes["y"], grid.sizes["x"]),
-            transform=grid.rio.transform(),
-            invert=True,
-            all_touched=True,
-        )
+
+        # Built lazily, one block per data chunk, on the workers. Building the
+        # whole mask here embedded a 1-byte-per-pixel array in the Dask graph
+        # (15 MiB for a 1,000 km2 AOI). Each block now rasterizes the polygon
+        # onto its own window, so only the polygon travels with the graph.
+        chunksizes = getattr(template, "chunksizes", None) or {}
+        ychunks = chunksizes.get("y", (grid.sizes["y"],))
+        xchunks = chunksizes.get("x", (grid.sizes["x"],))
+
+        def rasterize_block(block, block_info=None):
+            (y0, y1), (x0, x1) = block_info[0]["array-location"]
+            return geometry_mask(
+                [geom_projected],
+                out_shape=(y1 - y0, x1 - x0),
+                transform=transform @ Affine.translation(x0, y0),
+                invert=True,
+                all_touched=True,
+            )
+
+        base = da.zeros((grid.sizes["y"], grid.sizes["x"]), chunks=(ychunks, xchunks), dtype=bool)
+        inside = base.map_blocks(rasterize_block, dtype=bool)
         self._polygon_cache = xr.DataArray(inside, coords={"y": grid["y"], "x": grid["x"]}, dims=("y", "x"))
         return self._polygon_cache
 

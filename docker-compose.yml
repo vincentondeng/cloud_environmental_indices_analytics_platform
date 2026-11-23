@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DASK_CLUSTER_MODE: local
+      DASK_N_WORKERS: 4
+      STAC_PROVIDER: planetary-computer
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.frontend
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE: http://api:8000/api/v1
+    depends_on:
+      - api

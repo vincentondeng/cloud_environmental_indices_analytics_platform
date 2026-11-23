@@ -1,10 +1,11 @@
 """
 Orchestrates: polygon -> STAC search -> Dask-backed index cube ->
 [spatial mean, valid fraction, time-mean composite] (one shared compute
-call) -> time series / chart / composite PNG+GeoTIFF.
+call) -> time series / chart, plus composite files (GeoTIFF, figure PNG and
+map overlay PNG) written to output_dir when one is given.
 """
-import math
 import uuid
+from pathlib import Path
 
 import dask
 from pyproj import Geod
@@ -15,10 +16,10 @@ from app.core.dask_cluster import get_dask_client
 from app.core.stac_client import StacSearchClient
 from app.core.timeseries import build_lazy_mean_and_valid, linear_trend_per_year, mean_valid_to_dataframe, summary_stats, to_points
 from app.core.vegetation_indices import VegetationIndexEngine
-from app.models.schemas import AnalysisRequest, AnalysisResponse, IndexResult
+from app.models.schemas import AnalysisRequest, AnalysisResponse, IndexResult, MapLayer
 from app.utils.charts import build_timeseries_chart
-from app.utils.geotiff import array_to_geotiff_base64
-from app.utils.raster_image import array_to_png_base64
+from app.utils.geotiff import wgs84_bounds, write_geotiff
+from app.utils.raster_image import colormap_name, display_range, figure_png, legend_colors, overlay_png
 
 settings = get_settings()
 
@@ -35,7 +36,24 @@ def _aoi_area_km2(geometry: dict) -> float:
     return abs(area_m2) / 1e6
 
 
-def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
+def _write_composite_files(composite, index_name: str, output_dir: Path) -> MapLayer:
+    values = composite.values
+    vmin, vmax = display_range(values)
+    write_geotiff(composite, output_dir / f"{index_name}.tif")
+    (output_dir / f"{index_name}_figure.png").write_bytes(figure_png(values, index_name, vmin, vmax))
+    (output_dir / f"{index_name}_overlay.png").write_bytes(overlay_png(values, index_name, vmin, vmax))
+    return MapLayer(
+        bounds=wgs84_bounds(composite), vmin=vmin, vmax=vmax,
+        colormap=colormap_name(index_name), legend_colors=legend_colors(index_name),
+    )
+
+
+def run_analysis(request: AnalysisRequest, output_dir: Path | None = None) -> AnalysisResponse:
+    """
+    output_dir: where to write each index's composite files. The API passes
+    a per-job folder; direct callers (notebook, scripts) can leave it out
+    and get statistics and charts only.
+    """
     get_dask_client()  # raises clearly if the cluster isn't up
 
     geometry = _extract_geometry(request.geometry)
@@ -79,14 +97,15 @@ def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
         stats = summary_stats(df)
         chart_json = build_timeseries_chart(df, index.value, trend)
 
-        png_b64 = array_to_png_base64(computed_composite.values, index.value)
-        tif_b64 = array_to_geotiff_base64(computed_composite)
+        map_layer, files = None, []
+        if output_dir is not None:
+            map_layer = _write_composite_files(computed_composite, index.value, Path(output_dir))
+            files = ["geotiff", "overlay", "figure"]
 
         results.append(IndexResult(
             index=index, mean=stats["mean"], min=stats["min"], max=stats["max"], std=stats["std"],
             trend_per_year=trend, time_series=to_points(df), chart_json=chart_json,
-            composite_image_png_base64=png_b64,
-            composite_image_tif_base64=tif_b64,
+            map=map_layer, files=files,
         ))
 
     return AnalysisResponse(

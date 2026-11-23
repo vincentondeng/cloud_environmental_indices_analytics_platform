@@ -1,7 +1,19 @@
-# Cloud NDVI Analytics Platform
+# Cloud Environmental Indices Analytics Platform
 
-Send a polygon, get back NDVI trends for that area — computed from satellite
-imagery and returned as a time series plus a chart.
+Send a polygon, get back NDVI, EVI, SAVI and MNDWI trends for that area, computed
+from Sentinel-2 imagery and returned as a time series, a chart and a composite map
+(PNG for display, GeoTIFF for GIS).
+
+## What it does
+
+- Searches Sentinel-2 L2A scenes through STAC (Microsoft Planetary Computer or Earth Search).
+- Masks clouds and cloud shadows per pixel with the Scene Classification Layer (SCL).
+- Applies the correct reflectance scale and offset per scene (including the processing
+  baseline 04.00+ offset) before computing indices, and fetches only the bands each index needs.
+- Merges same-day tiles, clips to the polygon and reports geodesic area and the cloud-free
+  share inside the polygon.
+- Runs the computation on a Dask cluster behind a FastAPI service with background jobs,
+  and includes a Streamlit frontend.
 
 ## Try it locally
 
@@ -52,11 +64,30 @@ series, and a chart you can render directly.
 |---|---|---|
 | `POST` | `/api/v1/analyze` | Submit a polygon + date range, get a `job_id` |
 | `GET` | `/api/v1/jobs/{job_id}` | Check status / get the result |
+| `GET` | `/api/v1/jobs/{job_id}/files/{index}/{kind}` | Download a composite (`geotiff`, `overlay` or `figure`) |
 | `GET` | `/api/v1/health` | Is the service up |
 
-## Using the deployed version (once it's live on AWS)
+## Run the full stack with Docker
 
-Same everything — just swap `localhost:8000` for your deployed URL.
+```bash
+docker compose up --build
+```
+
+The API runs at `http://localhost:8000` and the Streamlit frontend at
+`http://localhost:8501`. To run the frontend without Docker:
+
+```bash
+pip install -r frontend/requirements.txt
+streamlit run frontend/app.py
+```
+
+An example area of interest is in `examples/nairobi.geojson` (an approximate,
+simplified boundary of Nairobi County).
+
+## Deployment
+
+Deployment to AWS is in progress. The configuration already supports running
+Dask on AWS Fargate (`DASK_CLUSTER_MODE=fargate`) instead of a local cluster.
 
 ## Running tests
 
